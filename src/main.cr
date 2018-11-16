@@ -2,17 +2,17 @@ require "http/server"
 require "http/client"
 require "uuid"
 
+require "./config"
+require "./logger"
+require "./users"
+
 COOKIE_NAME = "cr-proxy-token"
 
 class Proxy
-  @tokens = Hash(String, Time).new
+  @config : Config
 
-  @services = {
-    "crometheus" => {"127.0.0.1", 5000}
-  } of String => {String, Int32}
-
-  def initialize
-    @tokens["1234"] = Time.now
+  def initialize(@config : Config)
+    @users = Users.new(@config.password_file)
   end
 
   def check_authentication(headers) : Symbol
@@ -24,69 +24,90 @@ class Proxy
     end.find { |(n, v)| n == COOKIE_NAME }
     return :no_cookie unless value
     token = value[1]
-    valid_until = @tokens[token]?
-    puts valid_until
-    return :invalid unless valid_until
-    # TODO check valid time
+    is_valid = @users.valid_token?(token)
+    Log.info "Login using #{token}, token valid? #{is_valid}"
+    return :invalid unless is_valid
     :ok
   end
 
   def respond_authentication(context, status)
+    Log.info "Rendering login page"
     context.response.status_code = 401
     context.response.print {{ `cat templates/login.html`.stringify }}
   end
 
   def login_and_respond(context)
-    id = UUID.random.to_s
-    @tokens[id] = Time.now
+    Log.info "Logging in user"
+    io = context.request.body
+    return :error unless io
+    content = io.gets_to_end
+    Log.info("Login info: #{content}")
+    params = HTTP::Params.parse(content)
+    username = params["username"]
+    password = params["password"]
+    return :error unless username && password
+    unless @users.login_user(username, password)
+      return :invalid
+    end
+    id = @users.make_token_for(username, Time.now)
     context.response.status_code = 200
     context.response.headers.add(
       "Set-Cookie", "#{COOKIE_NAME}=#{id};"
     )
-    context.response.print "Logged in!"
+    context.response.print "Logged in as #{username}!"
+    return :ok
   end
 
-  def proxy(host, port)
+  def path_to_service_and_proxy(path)
+    end_idx = path.byte_index('/'.ord, 1)
+    if end_idx
+      service = path[1...end_idx]
+      proxy_path = path[end_idx...-1]
+    else
+      service = path[1..-1]
+      proxy_path = "/"
+    end
+    return service, proxy_path
+  end
+
+  def proxy
     server = HTTP::Server.new do |context|
-      path = context.request.path
-      end_idx = path.byte_index('/'.ord, 1)
-      if end_idx
-        service = path[1...end_idx]
-        proxy_path = path[end_idx...-1]
-      else
-        service = path[1..-1]
-        proxy_path = "/"
-      end
+      service, proxy_path = path_to_service_and_proxy(context.request.path)
       if service == "login"
-        puts "Logging in"
         login_and_respond(context)
         next
       end
-      found = @services[service]?
-      puts "#{service} #{found} - #{proxy_path}"
+      found = @config.get_host_and_port(service)
+      Log.info "#{service}: #{context.request.method}: #{proxy_path}"
       auth_status = check_authentication(context.request.headers)
       if auth_status != :ok
-        puts "Authentication failed: #{auth_status}"
+        Log.info "Authentication failed: #{auth_status}"
         respond_authentication(context, auth_status)
         next
       end
       unless found
-        puts "No host found"
+        Log.info "No host found for #{service}"
         next
       end
       host, port = found
       client = HTTP::Client.new host, port: port
-      response = client.get proxy_path
+      request = context.request
+      request.path = proxy_path
+      response = client.exec request
       context.response.status_code = response.status_code
       context.response.headers.merge! response.headers
       context.response.print response.body
       client.close
     end
 
-    server.bind_tcp host, port
-    puts "Proxying on http://#{host}:#{port}"
+    server.bind_tcp @config.host, @config.port
+    Log.info "Proxying on http://#{@config.host}:#{@config.port}"
     server.listen
   end
 end
 
-Proxy.new.proxy "0.0.0.0", 8080
+config_file = "config.yaml"
+config = Config.from_yaml File.read(config_file)
+Log.info "Loaded config from #{config_file}"
+
+Proxy.new(config).proxy
