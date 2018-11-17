@@ -5,11 +5,14 @@ require "uuid"
 require "./config"
 require "./logger"
 require "./users"
+require "./login"
 
 COOKIE_NAME = "cr-proxy-token"
 
 class Proxy
+  include Login
   @config : Config
+  @server : HTTP::Server? = nil
 
   def initialize(@config : Config)
     @users = Users.new(@config.password_file)
@@ -25,37 +28,25 @@ class Proxy
     return :no_cookie unless value
     token = value[1]
     is_valid = @users.valid_token?(token)
-    Log.info "Login using #{token}, token valid? #{is_valid}"
+    Log.debug "Login using #{token}, token valid? #{is_valid}"
     return :invalid unless is_valid
     :ok
   end
 
-  def respond_authentication(context, status)
-    Log.info "Rendering login page"
-    context.response.status_code = 401
-    context.response.print {{ `cat templates/login.html`.stringify }}
-  end
-
   def login_and_respond(context)
-    Log.info "Logging in user"
-    io = context.request.body
-    return :error unless io
-    content = io.gets_to_end
-    Log.info("Login info: #{content}")
-    params = HTTP::Params.parse(content)
-    username = params["username"]
-    password = params["password"]
-    return :error unless username && password
-    unless @users.login_user(username, password)
-      return :invalid
+    Log.debug("Attempting login")
+    status, username = authenticate_login(context)
+    if status == :ok && username
+      id = @users.make_token_for(username, 2.days.from_now)
+      context.response.status_code = 200
+      context.response.headers.add(
+        "Set-Cookie", "#{COOKIE_NAME}=#{id};"
+      )
+      Log.info("Login successful: #{username}")
+      render_services(context, @config)
+      return
     end
-    id = @users.make_token_for(username, Time.now)
-    context.response.status_code = 200
-    context.response.headers.add(
-      "Set-Cookie", "#{COOKIE_NAME}=#{id};"
-    )
-    context.response.print "Logged in as #{username}!"
-    return :ok
+    render_invalid(context, "Authentication failed")
   end
 
   def path_to_service_and_proxy(path)
@@ -71,7 +62,7 @@ class Proxy
   end
 
   def proxy
-    server = HTTP::Server.new do |context|
+    @server = server = HTTP::Server.new do |context|
       service, proxy_path = path_to_service_and_proxy(context.request.path)
       if service == "login"
         login_and_respond(context)
@@ -82,11 +73,12 @@ class Proxy
       auth_status = check_authentication(context.request.headers)
       if auth_status != :ok
         Log.info "Authentication failed: #{auth_status}"
-        respond_authentication(context, auth_status)
+        render_login(context, service)
         next
       end
       unless found
         Log.info "No host found for #{service}"
+        render_invalid(context, "Service doesn't exist: #{service}")
         next
       end
       host, port = found
@@ -104,10 +96,28 @@ class Proxy
     Log.info "Proxying on http://#{@config.host}:#{@config.port}"
     server.listen
   end
+
+  def save_tokens
+    @users.save(@config.password_file)
+  end
+
+  def stop
+    if server = @server
+      Log.info "Stopping server"
+      server.close
+    end
+  end
 end
 
 config_file = "config.yaml"
 config = Config.from_yaml File.read(config_file)
 Log.info "Loaded config from #{config_file}"
 
-Proxy.new(config).proxy
+proxy = Proxy.new(config)
+Signal::INT.trap do
+  Log.info "Interrupted!"
+  proxy.save_tokens
+  proxy.stop
+end
+proxy.proxy()
+

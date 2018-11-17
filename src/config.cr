@@ -2,6 +2,7 @@ require "yaml"
 
 class Config
   YAML.mapping(
+    base_url: String,
     host: String,
     port: Int32,
     services: Array(Service),

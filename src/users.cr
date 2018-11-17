@@ -52,19 +52,19 @@ class Users
         @tokens[token.value] = token.valid_until
       end
     end
+    Log.info "Loading logins for #{@registered.size} users, #{@tokens.size} tokens"
   end
 
   def save(file)
     store = UserStore.new
     p self
     @registered.each do |name, password|
-
-      tokens = (@user_tokens[name]? || [] of String).map { |token|
+      tokens = (@user_tokens[name]? || [] of String).map do |token|
         UserStore::Token.new(
           valid_until: @tokens[token],
           value: token,
         )
-      }
+      end
       store.users.push(
         UserStore::User.new(
           name: name,
@@ -84,7 +84,7 @@ class Users
   def login_user(user, password)
     expected_password = @registered[user]?
     return false unless expected_password
-    expected_password == password
+    Crypto::Bcrypt::Password.new(expected_password) == password
   end
 
   def valid_token?(token)
@@ -96,6 +96,8 @@ class Users
   def make_token_for(user, time)
     id = UUID.random.to_s
     @tokens[id] = time
+    @user_tokens[user] ||= [] of String
+    @user_tokens[user] << id
     id
   end
 end

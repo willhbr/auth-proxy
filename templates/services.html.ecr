@@ -1,0 +1,11 @@
+<html>
+  <head>
+  </head>
+  <body>
+    <ul>
+      <% @config.services.each do |service| %>
+        <li><a href="<%= @config.base_url %>/<%= service.name %>"><%= service.name %></a></li>
+      <% end %>
+    </ul>
+  </body>
+</html>
